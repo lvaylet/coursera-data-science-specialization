@@ -1,0 +1,179 @@
+---
+title: "Predict Activity Quality from Activity Monitors"
+author: "Laurent VAYLET"
+date: "Feb 13, 2015"
+output: html_document
+---
+
+# Background
+
+Using devices such as *Jawbone Up*, *Nike FuelBand* and *Fitbit*, it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement – a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how *much* of a particular activity they do, but they rarely quantify *how well they do it*. In this project, our goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website here: <http://groupware.les.inf.puc-rio.br/har> (see the section on the Weight Lifting Exercise Dataset).
+
+# Objective
+
+The goal of this project is to predict the manner in which the 6 participants did the exercise. This corresponds to the "classe" variable in the training set. Any of the other variables can be used to predict with.
+
+This report describes how the model is built, how cross validation was used, what the expected out of sample error is, and why the choices were made. The prediction model will also be used to predict 20 different test cases.
+
+# Approach
+
+1. Download and read training/test data
+2. Clean data by removing unnecessary variables (columns with a lot of NA values, user names, timestamps...)
+3. Slice training data for cross-validation
+4. Use PCA to reduce the number of covariates
+5. Train a Random Forest model on dimensionality-reduced training set
+6. Assess model performance on validation set
+7. Assess model performance on test set
+
+# Download and Read Rata
+
+If necessary, download both data set for training and testing:
+```{r}
+if (!file.exists("./pml-training.csv")) {
+  download.file("http://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", 
+                destfile = "./pml-training.csv")
+}
+if (!file.exists("./pml-testing.csv")) {
+  download.file("http://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", 
+                destfile = "./pml-testing.csv")
+}
+```
+
+Read training and test data sets, replacing any empty value with NA (that will be useful later on when removing columns with lots of NA values):
+
+```{r}
+training.raw <- read.csv("pml-training.csv", na.strings=c("","NA"))
+testing.raw <- read.csv("pml-testing.csv", na.string=c("","NA"))
+```
+
+# Clean Data
+
+Display structure of training data set in order to quickly get some insight in a compact form:
+
+```{r}
+str(training.raw)
+```
+
+At first sight, it looks like some covariates contain a lot of NA values. What is the exact proportion of NA values in every covariate?
+
+```{r}
+colSums(is.na(training.raw))/nrow(training.raw)
+```
+
+Wow, it looks lire more than half of all covariates have more than 97% NA values! Should we remove these covariates, or rather the examples they are associated with? Usually, it is better to keep a lot of observations rather than a lot of covariates, as having too many features can lead to overfitting while having too many examples is not that bad. So, in this case, it is better to remove the columns with a lot of NA, rather than removing the rows (using `complete.cases()`, for instance).
+
+So keep only the columns with no NA values, and discard the others:
+
+```{r}
+keep.cols = colSums(is.na(training.raw)) == 0
+training.tidy <- training.raw[, keep.cols]
+testing.tidy <- testing.raw[, keep.cols]
+```
+
+Now we are down to `r ncol(training.tidy)` covariates (as opposed to 160 at the beginning).
+
+Let's remove some more unnecessary columns (timestamps or factor variables that cannot be used for correlation computing later on):
+
+```{r}
+training.tidy <- subset(training.tidy, select = -c(X,
+                                                   user_name,
+                                                   raw_timestamp_part_1,
+                                                   raw_timestamp_part_2,
+                                                   cvtd_timestamp,
+                                                   new_window,
+                                                   num_window))
+testing.tidy <- subset(testing.tidy, select = -c(X,
+                                                 user_name,
+                                                 raw_timestamp_part_1,
+                                                 raw_timestamp_part_2,
+                                                 cvtd_timestamp,
+                                                 new_window,
+                                                 num_window))
+```
+
+Now we are just left with `r ncol(training.tidy)` compared to 160 for the raw unprocessed data.
+
+# Slice Data for Cross-Validation
+
+Split the training data into two sets for cross-validation (with the usual 60-40 ratio for training and validation):
+
+```{r}
+library(caret)
+set.seed(12345)
+inTrain <- createDataPartition(y = training.tidy$class, p = 0.6, list = FALSE)
+train <- training.tidy[inTrain, ]
+valid <- training.tidy[-inTrain, ]
+test <- testing.tidy
+dim(train)
+dim(valid)
+dim(test)
+```
+
+# Reduce Dimensionality with PCA
+
+Being left with only `r ncol(train)` covariates is good. However, we can try to reduce this number even further by identifying correlation between covariates and applying Principal Component Analysis to lower the number of features. Even if Random Forest can handle thousands of input variables without variable deletion, computation time is a precious resource.
+
+First, compute and plot correlation matrix to identify potentially correlated features (excluding the "classe" factor we actually want to predict):
+
+```{r, out.width = '\\maxwidth'}
+library(corrplot)
+corMat <- cor(subset(train, select=-c(classe)))
+corrplot(corMat, method = "color", cl.pos = "b", tl.pos = "n")
+```
+
+Plotting the correlation matrix confirms that some variables are heavily correlated (dark blue and dark red squares). So it is possible to reduce the number of variables (and computation time) by applying Principal Component Analysis.
+
+Perform PCA on all predictors (except the output "classe") and get the number of principal components necessary for retaining 95% of the variance:
+
+```{r}
+preProc.pca <- preProcess(subset(train, select = -c(classe)), method  = "pca", thresh = 0.95)
+train.pca <- predict(preProc.pca, subset(train, select = -c(classe)))
+valid.pca <- predict(preProc.pca, subset(valid, select = -c(classe)))
+test.pca <- predict(preProc.pca, subset(test, select = -c(problem_id)))
+print(preProc.pca)
+```
+
+# Train Random Forest Model
+
+Now train a Random Forest model using cross-validation and the reduced data from PCA.
+
+Random Forest was chosen as it offers the following benefits:
+
+* Accuracy
+* Runs efficiently on large data bases
+* Handles thousands of input variables without variable deletion
+* Gives estimates of what variables are important in the classification
+
+```{r}
+library(randomForest)
+modelFit <- train(train$classe ~ ., method = "rf", trControl = trainControl(method = "cv"), data = train.pca)
+modelFit
+```
+
+# Assess Model Performance on Validation Dataset
+
+Apply model to validation data and display confusion matrix:
+
+```{r}
+valid.pred <- predict(modelFit, valid.pca)
+confusionMatrix(valid.pred, valid$classe)
+```
+
+Out-of-Sample Error (OoSE) is defined as `1 - Accuracy`:
+
+```{r}
+1 - as.numeric(confusionMatrix(valid$classe, valid.pred)$overall[1])
+```
+
+So we get an OoSE of `r sprintf("%.2f%%", (1 - as.numeric(confusionMatrix(valid$classe, valid.pred)$overall[1]))*100)`, which is pretty good.
+
+# Assess Model Performance on Test Dataset
+
+Finally, apply model to 20 test cases:
+
+```{r}
+test.pred <- predict(modelFit, test.pca)
+test.pred
+```
+
+This model scored 100% in the submission page, meaning all test cases were predicted successfully.
